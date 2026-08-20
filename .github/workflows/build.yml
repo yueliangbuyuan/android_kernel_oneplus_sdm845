@@ -1,0 +1,65 @@
+name: Build ReSukiSU fajita Kernel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout kernel
+      uses: actions/checkout@v4
+
+    - name: Install packages
+      run: |
+        sudo apt update
+        sudo apt install -y \
+          bc bison flex make gcc g++ \
+          libssl-dev libelf-dev \
+          python3 cpio rsync unzip
+
+    - name: Install clang
+      run: |
+        git clone --depth=1 \
+        https://github.com/LineageOS/android_prebuilts_clang_host_linux-x86 \
+        clang
+
+    - name: Clone ReSukiSU
+      run: |
+        git clone --depth=1 \
+        https://github.com/ReSukiSU/ReSukiSU.git
+
+    - name: Add ReSukiSU
+      run: |
+        cp -r ReSukiSU/kernel/* .
+
+    - name: Configure kernel
+      run: |
+        export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+
+        make O=out ARCH=arm64 lineage_defconfig || \
+        make O=out ARCH=arm64 fajita_defconfig
+
+        scripts/config --enable KSU
+        scripts/config --enable KALLSYMS
+        scripts/config --enable KALLSYMS_ALL
+        scripts/config --enable KPROBES
+        scripts/config --enable OVERLAY_FS
+
+    - name: Compile
+      run: |
+        export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+
+        make O=out \
+        ARCH=arm64 \
+        LLVM=1 \
+        LLVM_IAS=1 \
+        -j$(nproc)
+
+    - name: Upload kernel
+      uses: actions/upload-artifact@v4
+      with:
+        name: fajita-resukisu-kernel
+        path: |
+          out/arch/arm64/boot/Image.gz
