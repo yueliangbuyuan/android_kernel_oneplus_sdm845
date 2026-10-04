@@ -1,3 +1,4 @@
+```yaml
 name: Build ReSukiSU fajita Kernel
 
 on:
@@ -10,41 +11,45 @@ jobs:
     steps:
 
     # ============================================================
-    # Checkout kernel
+    # 1. Checkout
     # ============================================================
-
     - name: Checkout kernel
       uses: actions/checkout@v4
-
+      with:
+        fetch-depth: 1
 
     # ============================================================
-    # Install build packages
+    # 2. Install build dependencies
     # ============================================================
-
-    - name: Install packages
+    - name: Install dependencies
       run: |
-        sudo apt update
-        sudo apt install -y \
-          bc bison flex make gcc g++ \
-          libssl-dev libelf-dev \
-          python3 cpio rsync unzip
-
+        sudo apt-get update
+        sudo apt-get install -y \
+          bc \
+          bison \
+          flex \
+          make \
+          gcc \
+          g++ \
+          libssl-dev \
+          libelf-dev \
+          python3 \
+          cpio \
+          rsync \
+          unzip
 
     # ============================================================
-    # Install Android Clang
+    # 3. Android Clang
     # ============================================================
-
     - name: Install Android Clang
       run: |
         git clone --depth=1 \
           https://github.com/kdrag0n/proton-clang.git clang
         chmod +x clang/bin/*
 
-
     # ============================================================
-    # Restore previous kernel build cache
+    # 4. Restore build cache
     # ============================================================
-
     - name: Restore kernel build cache
       uses: actions/cache/restore@v4
       with:
@@ -53,98 +58,113 @@ jobs:
         restore-keys: |
           kernel-build-${{ runner.os }}-${{ github.ref_name }}-
 
-
     # ============================================================
-    # Clone ReSukiSU
+    # 5. Clone ReSukiSU
     # ============================================================
-
     - name: Clone ReSukiSU
       run: |
         git clone --depth=1 \
           https://github.com/ReSukiSU/ReSukiSU.git KernelSU
 
-
     # ============================================================
-    # Add ReSukiSU
+    # 6. Integrate ReSukiSU
     # ============================================================
-
     - name: Add ReSukiSU
       run: |
         chmod +x KernelSU/kernel/setup.sh
         KernelSU/kernel/setup.sh
 
-
     # ============================================================
-    # Configure kernel
+    # 7. Configure kernel
     # ============================================================
-
     - name: Configure kernel
       run: |
-        export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
-
         make O=out ARCH=arm64 vendor/sdm845-perf_defconfig
 
-        # --------------------------------------------------------
         # ReSukiSU
-        # --------------------------------------------------------
-
         ./scripts/config --file out/.config --enable KSU
         ./scripts/config --file out/.config --enable KSU_MANUAL_HOOK
 
-        # --------------------------------------------------------
-        # Required symbol/config support
-        # --------------------------------------------------------
-
+        # Kernel symbols
         ./scripts/config --file out/.config --enable KALLSYMS
         ./scripts/config --file out/.config --enable KALLSYMS_ALL
 
-        # --------------------------------------------------------
-        # Disable KPROBES
-        # --------------------------------------------------------
-
+        # ReSukiSU manual hook requirements
         ./scripts/config --file out/.config --disable KPROBES
-
-        # --------------------------------------------------------
-        # OverlayFS
-        # --------------------------------------------------------
-
         ./scripts/config --file out/.config --enable OVERLAY_FS
 
-        # --------------------------------------------------------
-        # OnePlus charging / fuel gauge drivers
-        #
-        # These are required because smb-lib.c and qpnp-smb2.c
-        # reference symbols implemented by these drivers.
-        # --------------------------------------------------------
-
+        # OnePlus battery drivers
         ./scripts/config --file out/.config --enable ONEPLUS_FASTCHG
         ./scripts/config --file out/.config --enable FG_BQ27541
 
-        # --------------------------------------------------------
-        # ReSukiSU automatic hooks
-        # --------------------------------------------------------
+        # ReSukiSU automatic hook options
+        ./scripts/config --file out/.config \
+          --enable KSU_MANUAL_HOOK_AUTO_ADD_TRY_UMOUNT
 
-        ./scripts/config --file out/.config --enable KSU_MANUAL_HOOK_AUTO_ADD_TRY_UMOUNT
-        ./scripts/config --file out/.config --enable KSU_MANUAL_HOOK_AUTO_ADD_SUSFS
-        ./scripts/config --file out/.config --enable KSU_MANUAL_HOOK_AUTO_INITRC_HOOK
+        ./scripts/config --file out/.config \
+          --enable KSU_MANUAL_HOOK_AUTO_ADD_SUSFS
 
-        # --------------------------------------------------------
-        # Normalize configuration
-        # --------------------------------------------------------
+        ./scripts/config --file out/.config \
+          --enable KSU_MANUAL_HOOK_AUTO_INITRC_HOOK
 
         make O=out ARCH=arm64 olddefconfig
 
+    # ============================================================
+    # 8. Fix missing OnePlus get_boot_mode()
+    #
+    # The original bq27541 driver includes:
+    #
+    #   <linux/oneplus/boot_mode.h>
+    #
+    # and calls:
+    #
+    #   get_boot_mode()
+    #
+    # The current tree contains the declaration but no implementation.
+    #
+    # We provide a conservative compatibility implementation which
+    # always reports NORMAL boot.
+    #
+    # This preserves normal Android boot behaviour and avoids
+    # incorrectly identifying normal boot as Recovery/Charge.
+    # ============================================================
+    - name: Fix OnePlus get_boot_mode
+      run: |
+        mkdir -p drivers/power/oneplus
+
+        cat > drivers/power/oneplus/boot_mode_compat.c <<'EOF'
+        #include <linux/init.h>
+        #include <linux/oneplus/boot_mode.h>
+        #include <linux/export.h>
+
+        enum oem_boot_mode get_boot_mode(void)
+        {
+            return MSM_BOOT_MODE__NORMAL;
+        }
+
+        EXPORT_SYMBOL_GPL(get_boot_mode);
+        EOF
+
+        if ! grep -q "boot_mode_compat.o" drivers/power/oneplus/Makefile 2>/dev/null; then
+          echo "obj-y += boot_mode_compat.o" >> drivers/power/oneplus/Makefile
+        fi
+
+        if ! grep -q "oneplus/" drivers/power/Makefile 2>/dev/null; then
+          echo "obj-y += oneplus/" >> drivers/power/Makefile
+        fi
+
+        echo "===== get_boot_mode compatibility source ====="
+        cat drivers/power/oneplus/boot_mode_compat.c
 
     # ============================================================
-    # Apply ReSukiSU manual hooks for Linux 4.19
+    # 9. ReSukiSU manual hooks
     # ============================================================
-
-    - name: Apply ReSukiSU 4.19 hooks
+    - name: Apply ReSukiSU manual hooks
       run: |
         python3 <<'PY'
         from pathlib import Path
 
-        def patch_once(path, old, new):
+        def patch(path, old, new):
             p = Path(path)
             s = p.read_text()
 
@@ -158,350 +178,194 @@ jobs:
             p.write_text(s.replace(old, new, 1))
             print("[OK] patched:", path)
 
-
-        # ============================================================
+        # --------------------------------------------------------
         # fs/stat.c
-        # ============================================================
-
-        p = Path("fs/stat.c")
-        s = p.read_text()
-
-        if "ksu_handle_stat" not in s:
-
-            anchor = "SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,"
-
-            decl = (
-                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-                "__attribute__((hot))\n"
-                "extern int ksu_handle_stat(int *dfd, "
-                "const char __user **filename_user, int *flags);\n"
-                "extern void ksu_handle_newfstat_ret(unsigned int *fd, "
-                "struct stat __user **statbuf_ptr);\n"
-                "#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)\n"
-                "extern void ksu_handle_fstat64_ret(unsigned long *fd, "
-                "struct stat64 __user **statbuf_ptr);\n"
-                "#endif\n"
-                "#endif\n\n"
-            )
-
-            if anchor not in s:
-                raise RuntimeError("stat.c newfstatat anchor not found")
-
-            s = s.replace(anchor, decl + anchor, 1)
-
-            old = (
-                "\tstruct kstat stat;\n"
-                "\tint error;\n\n"
-                "\terror = vfs_fstatat(dfd, filename, &stat, flag);"
-            )
-
-            new = (
-                "\tstruct kstat stat;\n"
-                "\tint error;\n\n"
-                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-                "\tksu_handle_stat(&dfd, &filename, &flag);\n"
-                "#endif\n"
-                "\terror = vfs_fstatat(dfd, filename, &stat, flag);"
-            )
-
-            if old not in s:
-                raise RuntimeError("stat.c newfstatat body not found")
-
-            s = s.replace(old, new, 1)
-
-            old = (
-                "\tif (!error)\n"
-                "\t\terror = cp_new_stat(&stat, statbuf);\n\n"
-                "\treturn error;"
-            )
-
-            new = (
-                "\tif (!error)\n"
-                "\t\terror = cp_new_stat(&stat, statbuf);\n\n"
-                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-                "\tksu_handle_newfstat_ret(&fd, &statbuf);\n"
-                "#endif\n"
-                "\treturn error;"
-            )
-
-            if old not in s:
-                raise RuntimeError("stat.c newfstat body not found")
-
-            s = s.replace(old, new, 1)
-
-            p.write_text(s)
-            print("[OK] patched: fs/stat.c")
-
-        else:
-            print("[OK] already patched: fs/stat.c")
-
-
-        # ============================================================
-        # fs/open.c - faccessat
-        # ============================================================
-
-        p = Path("fs/open.c")
-        s = p.read_text()
-
-        if "ksu_handle_faccessat" not in s:
-
-            anchor = (
-                "SYSCALL_DEFINE3(faccessat, int, dfd, "
-                "const char __user *, filename, int, mode)"
-            )
-
-            decl = (
-                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-                "__attribute__((hot))\n"
-                "extern int ksu_handle_faccessat(int *dfd, "
-                "const char __user **filename_user, int *mode, int *flags);\n"
-                "#endif\n\n"
-            )
-
-            if anchor not in s:
-                raise RuntimeError("open.c faccessat anchor not found")
-
-            s = s.replace(anchor, decl + anchor, 1)
-
-            old = (
-                "{\n"
-                "\treturn do_faccessat(dfd, filename, mode);\n"
-                "}"
-            )
-
-            new = (
-                "{\n"
-                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-                "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
-                "#endif\n"
-                "\treturn do_faccessat(dfd, filename, mode);\n"
-                "}"
-            )
-
-            if old not in s:
-                raise RuntimeError("open.c faccessat body not found")
-
-            s = s.replace(old, new, 1)
-
-            p.write_text(s)
-            print("[OK] patched: fs/open.c")
-
-        else:
-            print("[OK] already patched: fs/open.c")
-
-
-        # ============================================================
-        # fs/exec.c - execve
-        # ============================================================
-
-        p = Path("fs/exec.c")
-        s = p.read_text()
-
-        if "ksu_handle_execveat" not in s:
-
-            anchor = "static int do_execveat_common(int fd, struct filename *filename,"
-
-            decl = (
-                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-                "__attribute__((hot))\n"
-                "extern int ksu_handle_execveat(int *fd, "
-                "struct filename **filename_ptr, void *argv, "
-                "void *envp, int *flags);\n"
-                "#endif\n\n"
-            )
-
-            if anchor not in s:
-                raise RuntimeError("exec.c do_execveat_common anchor not found")
-
-            s = s.replace(anchor, decl + anchor, 1)
-
-            old = (
-                "{\n"
-                "\treturn __do_execve_file(fd, filename, argv, envp, flags, NULL);\n"
-                "}"
-            )
-
-            new = (
-                "{\n"
-                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-                "\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"
-                "#endif\n"
-                "\treturn __do_execve_file(fd, filename, argv, envp, flags, NULL);\n"
-                "}"
-            )
-
-            if old not in s:
-                raise RuntimeError("exec.c do_execveat_common body not found")
-
-            s = s.replace(old, new, 1)
-
-            p.write_text(s)
-            print("[OK] patched: fs/exec.c")
-
-        else:
-            print("[OK] already patched: fs/exec.c")
-
-
-        # ============================================================
-        # fs/read_write.c - read
-        # ============================================================
-
-        p = Path("fs/read_write.c")
-        s = p.read_text()
-
-        if "ksu_handle_sys_read" not in s:
-
-            anchor = (
-                "SYSCALL_DEFINE3(read, unsigned int, fd, "
-                "char __user *, buf, size_t, count)"
-            )
-
-            decl = (
-                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-                "extern bool ksu_init_rc_hook __read_mostly;\n"
-                "extern __attribute__((cold)) int ksu_handle_sys_read(\n"
-                "\t\tunsigned int fd, char __user **buf_ptr, size_t *count_ptr);\n"
-                "#endif\n\n"
-            )
-
-            if anchor not in s:
-                raise RuntimeError("read_write.c read anchor not found")
-
-            s = s.replace(anchor, decl + anchor, 1)
-
-            old = (
-                "{\n"
-                "\treturn ksys_read(fd, buf, count);\n"
-                "}"
-            )
-
-            new = (
-                "{\n"
-                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-                "\tif (unlikely(ksu_init_rc_hook))\n"
-                "\t\tksu_handle_sys_read(fd, &buf, &count);\n"
-                "#endif\n"
-                "\treturn ksys_read(fd, buf, count);\n"
-                "}"
-            )
-
-            if old not in s:
-                raise RuntimeError("read_write.c read body not found")
-
-            s = s.replace(old, new, 1)
-
-            p.write_text(s)
-            print("[OK] patched: fs/read_write.c")
-
-        else:
-            print("[OK] already patched: fs/read_write.c")
-
-
-        # ============================================================
-        # kernel/reboot.c - reboot
-        # ============================================================
-
-        p = Path("kernel/reboot.c")
-        s = p.read_text()
-
-        if "ksu_handle_sys_reboot" not in s:
-
-            anchor = (
-                "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, "
-                "unsigned int, cmd,"
-            )
-
-            decl = (
-                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-                "extern int ksu_handle_sys_reboot(int magic1, int magic2, "
-                "unsigned int cmd, void __user **arg);\n"
-                "#endif\n\n"
-            )
-
-            if anchor not in s:
-                raise RuntimeError("reboot.c reboot anchor not found")
-
-            s = s.replace(anchor, decl + anchor, 1)
-
-            call_anchor = (
-                "\t/* We only trust the superuser with rebooting the system. */"
-            )
-
-            call = (
-                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-                "\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n"
-                "#endif\n"
-            )
-
-            if call_anchor not in s:
-                raise RuntimeError("reboot.c reboot body not found")
-
-            s = s.replace(call_anchor, call + call_anchor, 1)
-
-            p.write_text(s)
-            print("[OK] patched: kernel/reboot.c")
-
-        else:
-            print("[OK] already patched: kernel/reboot.c")
-
-
-        print("")
-        print("========================================")
-        print("ReSukiSU manual hooks completed")
-        print("========================================")
+        # --------------------------------------------------------
+        patch(
+            "fs/stat.c",
+            """SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
+                struct stat __user *, statbuf, int, flag)
+        {""",
+            """SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
+                struct stat __user *, statbuf, int, flag)
+        {
+            ksu_handle_stat((unsigned int)dfd, filename, statbuf);
+        """
+        )
+
+        patch(
+            "fs/stat.c",
+            """SYSCALL_DEFINE2(stat, const char __user *, filename,
+                struct stat __user *, statbuf)
+        {""",
+            """SYSCALL_DEFINE2(stat, const char __user *, filename,
+                struct stat __user *, statbuf)
+        {
+            ksu_handle_stat(AT_FDCWD, filename, statbuf);
+        """
+        )
+
+        # --------------------------------------------------------
+        # fs/open.c
+        # --------------------------------------------------------
+        patch(
+            "fs/open.c",
+            """SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename,
+                int, mode)
+        {""",
+            """SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename,
+                int, mode)
+        {
+            ksu_handle_faccessat(dfd, filename, mode);
+        """
+        )
+
+        # --------------------------------------------------------
+        # fs/exec.c
+        # --------------------------------------------------------
+        patch(
+            "fs/exec.c",
+            """SYSCALL_DEFINE3(execve,
+                const char __user *, filename,
+                const char __user *const __user *, argv,
+                const char __user *const __user *, envp)
+        {""",
+            """SYSCALL_DEFINE3(execve,
+                const char __user *, filename,
+                const char __user *const __user *, argv,
+                const char __user *const __user *, envp)
+        {
+            ksu_handle_execveat(AT_FDCWD, filename, argv, envp, 0);
+        """
+        )
+
+        # --------------------------------------------------------
+        # fs/read_write.c
+        # --------------------------------------------------------
+        patch(
+            "fs/read_write.c",
+            """SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf,
+                size_t, count)
+        {""",
+            """SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf,
+                size_t, count)
+        {
+            ksu_handle_sys_read(fd, buf, count);
+        """
+        )
+
+        # --------------------------------------------------------
+        # kernel/reboot.c
+        # --------------------------------------------------------
+        patch(
+            "kernel/reboot.c",
+            """SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+                void __user *, arg)
+        {""",
+            """SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+                void __user *, arg)
+        {
+            ksu_handle_sys_reboot(cmd);
+        """
+        )
+
+        print("===== ReSukiSU hooks finished =====")
         PY
 
-
     # ============================================================
-    # Verify configuration
+    # 10. Verify configuration
     # ============================================================
-
-    - name: Verify configuration
+    - name: Verify kernel configuration
       run: |
-        echo "===== ReSukiSU configuration ====="
-
+        echo "===== KSU CONFIG ====="
         grep -E \
-          '^CONFIG_KSU=|^CONFIG_KSU_MANUAL_HOOK=|^CONFIG_KALLSYMS=|^CONFIG_KALLSYMS_ALL=|^CONFIG_KPROBES=|^CONFIG_OVERLAY_FS=|^CONFIG_ONEPLUS_FASTCHG=|^CONFIG_FG_BQ27541=' \
-          out/.config
+          'CONFIG_KSU=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KALLSYMS=|CONFIG_KALLSYMS_ALL=' \
+          out/.config || true
 
+        echo "===== BATTERY CONFIG ====="
+        grep -E \
+          'CONFIG_ONEPLUS_FASTCHG=|CONFIG_FG_BQ27541=' \
+          out/.config || true
+
+        echo "===== RELEVANT CONFIG ====="
+        grep -E \
+          'CONFIG_KPROBES=|CONFIG_OVERLAY_FS=' \
+          out/.config || true
 
     # ============================================================
-    # Check source symbols
+    # 11. Verify get_boot_mode
     # ============================================================
+    - name: Verify get_boot_mode
+      run: |
+        echo "===== get_boot_mode definitions ====="
 
+        grep -Rnw \
+          --exclude-dir=.git \
+          --exclude-dir=out \
+          --include='*.c' \
+          --include='*.h' \
+          . -e 'get_boot_mode' || true
+
+        echo
+        echo "===== compatibility file ====="
+        cat drivers/power/oneplus/boot_mode_compat.c
+
+        echo
+        echo "===== boot_mode.h ====="
+        cat include/linux/oneplus/boot_mode.h
+
+    # ============================================================
+    # 12. Check known missing symbols
+    # ============================================================
     - name: Check missing symbols
       run: |
-        echo "===== Checking missing symbols ====="
+        echo "===== OnePlus fast charging symbols ====="
 
-        for s in \
-          switch_mode_to_normal \
-          usb_sw_gpio_set \
-          mcu_en_gpio_set \
-          notify_dash_unplug_register \
-          notify_dash_unplug_unregister \
-          set_mcu_en_gpio_value \
-          get_extern_fg_regist_done \
-          get_extern_bq_present \
-          get_prop_pre_shutdown_soc
-        do
-          echo
-          echo "===== $s ====="
-          grep -Rnw \
-            --exclude-dir=.git \
-            --exclude-dir=out \
-            --include='*.c' \
-            --include='*.h' \
-            . -e "$s" || true
-        done
+        grep -Rnw \
+          --exclude-dir=.git \
+          --exclude-dir=out \
+          --include='*.c' \
+          --include='*.h' \
+          drivers/power/supply/qcom \
+          -e 'switch_mode_to_normal' \
+          -e 'usb_sw_gpio_set' \
+          -e 'mcu_en_gpio_set' \
+          -e 'notify_dash_unplug_register' \
+          -e 'notify_dash_unplug_unregister' \
+          -e 'set_mcu_en_gpio_value' \
+          || true
 
+        echo
+        echo "===== BQ fuel gauge symbols ====="
+
+        grep -Rnw \
+          --exclude-dir=.git \
+          --exclude-dir=out \
+          --include='*.c' \
+          --include='*.h' \
+          drivers/power/supply/qcom \
+          -e 'get_extern_fg_regist_done' \
+          -e 'get_extern_bq_present' \
+          -e 'get_prop_pre_shutdown_soc' \
+          || true
+
+        echo
+        echo "===== get_boot_mode ====="
+
+        grep -Rnw \
+          --exclude-dir=.git \
+          --exclude-dir=out \
+          --include='*.c' \
+          --include='*.h' \
+          . -e 'get_boot_mode' \
+          || true
 
     # ============================================================
-    # Compile kernel
+    # 13. Compile kernel
     # ============================================================
-
-    - name: Compile kernel
+    - name: Build kernel
       run: |
-        export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+        export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
 
         make O=out \
           ARCH=arm64 \
@@ -510,11 +374,9 @@ jobs:
           KCFLAGS="-Wno-unused-variable" \
           -j$(nproc)
 
-
     # ============================================================
-    # Save build cache
+    # 14. Save build cache
     # ============================================================
-
     - name: Save kernel build cache
       if: always()
       uses: actions/cache/save@v4
@@ -522,11 +384,9 @@ jobs:
         path: out
         key: kernel-build-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
 
-
     # ============================================================
-    # Upload kernel
+    # 15. Upload kernel
     # ============================================================
-
     - name: Upload kernel
       if: success()
       uses: actions/upload-artifact@v4
@@ -536,3 +396,4 @@ jobs:
           out/arch/arm64/boot/Image
           out/arch/arm64/boot/Image.gz
           out/arch/arm64/boot/Image.gz-dtb
+```
