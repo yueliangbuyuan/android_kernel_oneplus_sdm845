@@ -206,25 +206,21 @@ jobs:
           # ------------------------------------------------------------
 
           patch(
-              "kernel/reboot.c",
-              """static DEFINE_MUTEX(reboot_mutex);""",
-              """static DEFINE_MUTEX(reboot_mutex);
-
-          #ifdef CONFIG_KSU_MANUAL_HOOK
+            "kernel/reboot.c",
+            """SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+          \tvoid __user *, arg)
+          {""",
+            """#ifdef CONFIG_KSU_MANUAL_HOOK
           extern int ksu_handle_sys_reboot(int magic1, int magic2,
-                          unsigned int cmd, void __user **arg);
-          #endif"""
-          )
+                        unsigned int cmd, void __user **arg);
+          #endif
 
-          patch(
-              "kernel/reboot.c",
-              """\tchar buffer[256];
-          \tint ret = 0;""",
-              """\tchar buffer[256];
-          \tint ret = 0;
-
+          SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+          \tvoid __user *, arg)
+          {
           #ifdef CONFIG_KSU_MANUAL_HOOK
-          \tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+          \tif (system_state == SYSTEM_RUNNING)
+          \t\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
           #endif"""
           )
 
