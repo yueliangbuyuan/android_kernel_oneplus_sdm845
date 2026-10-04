@@ -374,6 +374,31 @@ jobs:
       run: |
         grep -E '^CONFIG_KSU=|^CONFIG_KSU_MANUAL_HOOK=|^CONFIG_KALLSYMS=|^CONFIG_KALLSYMS_ALL=|^CONFIG_KPROBES=|^CONFIG_OVERLAY_FS=' out/.config
 
+    - name: Check missing symbols
+      run: |
+        echo "===== Checking missing symbols ====="
+
+        for s in \
+          switch_mode_to_normal \
+          usb_sw_gpio_set \
+          mcu_en_gpio_set \
+          notify_dash_unplug_register \
+          notify_dash_unplug_unregister \
+          set_mcu_en_gpio_value \
+          get_extern_fg_regist_done \
+          get_extern_bq_present \
+          get_prop_pre_shutdown_soc
+        do
+          echo
+          echo "===== $s ====="
+          grep -Rnw \
+            --exclude-dir=.git \
+            --exclude-dir=out \
+            --include='*.c' \
+            --include='*.h' \
+            . -e "$s" || true
+        done
+
     - name: Compile kernel
       run: |
         export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
