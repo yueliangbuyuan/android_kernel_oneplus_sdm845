@@ -8,58 +8,351 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-    - name: Checkout kernel
-      uses: actions/checkout@v4
+      - name: Checkout kernel
+        uses: actions/checkout@v4
 
-    - name: Install packages
-      run: |
-        sudo apt update
-        sudo apt install -y \
-          bc bison flex make gcc g++ \
-          libssl-dev libelf-dev \
-          python3 cpio rsync unzip
+      - name: Install packages
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            bc bison flex make gcc g++ \
+            libssl-dev libelf-dev \
+            python3 cpio rsync unzip wget
 
-    - name: Install clang
-      run: |
-        wget -q https://github.com/kdrag0n/proton-clang/releases/download/2022-05-17/proton-clang.tar.gz
-        mkdir clang
-        tar -xf proton-clang.tar.gz -C clang
+      - name: Install Android Clang
+        run: |
+          wget -q https://github.com/kdrag0n/proton-clang/releases/download/2022-05-17/proton-clang.tar.gz
+          mkdir -p clang
+          tar -xf proton-clang.tar.gz -C clang
 
-    - name: Clone ReSukiSU
-      run: |
-        git clone --depth=1 \
-        https://github.com/ReSukiSU/ReSukiSU.git
+      - name: Integrate ReSukiSU
+        run: |
+          git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
+          chmod +x KernelSU/kernel/setup.sh
+          KernelSU/kernel/setup.sh
 
-    - name: Add ReSukiSU
-      run: |
-        cp -r ReSukiSU/kernel/* .
+      - name: Configure kernel
+        run: |
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
 
-    - name: Configure kernel
-      run: |
-        export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+          make O=out ARCH=arm64 sdm845-perf_defconfig
 
-        make O=out ARCH=arm64 lineage_defconfig || \
-        make O=out ARCH=arm64 fajita_defconfig
+          scripts/config --file out/.config --enable KSU
+          scripts/config --file out/.config --enable KSU_MANUAL_HOOK
 
-        scripts/config --enable KSU
-        scripts/config --enable KALLSYMS
-        scripts/config --enable KALLSYMS_ALL
-        scripts/config --enable KPROBES
-        scripts/config --enable OVERLAY_FS
+          scripts/config --file out/.config --enable KSU_MANUAL_HOOK_AUTO_SETUID_HOOK
+          scripts/config --file out/.config --enable KSU_MANUAL_HOOK_AUTO_INITRC_HOOK
+          scripts/config --file out/.config --enable KSU_MANUAL_HOOK_AUTO_INPUT_HOOK
 
-    - name: Compile
-      run: |
-        export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+          scripts/config --file out/.config --enable KALLSYMS
+          scripts/config --file out/.config --enable KALLSYMS_ALL
+          scripts/config --file out/.config --disable KPROBES
+          scripts/config --file out/.config --enable OVERLAY_FS
 
-        make O=out \
-        ARCH=arm64 \
-        LLVM=1 \
-        LLVM_IAS=1 \
-        -j$(nproc)
+          make O=out ARCH=arm64 olddefconfig
 
-    - name: Upload kernel
-      uses: actions/upload-artifact@v4
-      with:
-        name: fajita-resukisu-kernel
-        path: |
-          out/arch/arm64/boot/Image.gz
+      - name: Apply ReSukiSU 4.19 hooks
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          def patch(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+
+              if new in s:
+                  print("[OK] already patched:", path)
+                  return
+
+              if old not in s:
+                  raise RuntimeError("Patch target not found: " + path)
+
+              p.write_text(s.replace(old, new, 1))
+              print("[OK] patched:", path)
+
+          # ------------------------------------------------------------
+          # fs/stat.c
+          # ------------------------------------------------------------
+
+          patch(
+              "fs/stat.c",
+              """#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)""",
+              """#ifdef CONFIG_KSU_MANUAL_HOOK
+          __attribute__((hot))
+          extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
+                          int *flags);
+          extern void ksu_handle_newfstat_ret(unsigned int *fd,
+                          struct stat __user **statbuf_ptr);
+          #if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
+          extern void ksu_handle_fstat64_ret(unsigned long *fd,
+                          struct stat64 __user **statbuf_ptr);
+          #endif
+          #endif
+
+          #if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)"""
+          )
+
+          patch(
+              "fs/stat.c",
+              """{
+          \tstruct kstat stat;
+          \tint error;
+
+          \terror = vfs_fstatat(dfd, filename, &stat, flag);""",
+              """{
+          \tstruct kstat stat;
+          \tint error;
+
+          #ifdef CONFIG_KSU_MANUAL_HOOK
+          \tksu_handle_stat(&dfd, &filename, &flag);
+          #endif
+
+          \terror = vfs_fstatat(dfd, filename, &stat, flag);"""
+          )
+
+          patch(
+              "fs/stat.c",
+              """\tif (!error)
+          \t\terror = cp_new_stat(&stat, statbuf);
+
+          \treturn error;
+          }
+
+          static int do_readlinkat""",
+              """\tif (!error)
+          \t\terror = cp_new_stat(&stat, statbuf);
+
+          #ifdef CONFIG_KSU_MANUAL_HOOK
+          \tksu_handle_newfstat_ret(&fd, &statbuf);
+          #endif
+
+          \treturn error;
+          }
+
+          static int do_readlinkat"""
+          )
+
+          # ------------------------------------------------------------
+          # fs/stat.c - fstat64 / fstatat64
+          # ------------------------------------------------------------
+
+          patch(
+              "fs/stat.c",
+              """SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)
+          {
+          \tstruct kstat stat;
+          \tint error = vfs_fstat(fd, &stat);
+
+          \tif (!error)
+          \t\terror = cp_new_stat64(&stat, statbuf);
+
+          \treturn error;
+          }""",
+              """SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)
+          {
+          \tstruct kstat stat;
+          \tint error = vfs_fstat(fd, &stat);
+
+          \tif (!error)
+          \t\terror = cp_new_stat64(&stat, statbuf);
+
+          #ifdef CONFIG_KSU_MANUAL_HOOK
+          \tksu_handle_fstat64_ret(&fd, &statbuf);
+          #endif
+
+          \treturn error;
+          }"""
+          )
+
+          patch(
+              "fs/stat.c",
+              """SYSCALL_DEFINE4(fstatat64, int, dfd, const char __user *, filename,
+          \t\tstruct stat64 __user *, statbuf, int, flag)
+          {
+          \tstruct kstat stat;
+          \tint error;
+          \terror = vfs_fstatat(dfd, filename, &stat, flag);""",
+              """SYSCALL_DEFINE4(fstatat64, int, dfd, const char __user *, filename,
+          \t\tstruct stat64 __user *, statbuf, int, flag)
+          {
+          \tstruct kstat stat;
+          \tint error;
+          #ifdef CONFIG_KSU_MANUAL_HOOK
+          \tksu_handle_stat(&dfd, &filename, &flag);
+          #endif
+          \terror = vfs_fstatat(dfd, filename, &stat, flag);"""
+          )
+
+          # ------------------------------------------------------------
+          # fs/open.c - faccessat
+          # ------------------------------------------------------------
+
+          patch(
+              "fs/open.c",
+              """SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+          {
+          \treturn do_faccessat(dfd, filename, mode);
+          }""",
+              """#ifdef CONFIG_KSU_MANUAL_HOOK
+          __attribute__((hot))
+          extern int ksu_handle_faccessat(int *dfd,
+                          const char __user **filename_user,
+                          int *mode, int *flags);
+          #endif
+
+          SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+          {
+          #ifdef CONFIG_KSU_MANUAL_HOOK
+          \tksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+          #endif
+          \treturn do_faccessat(dfd, filename, mode);
+          }"""
+          )
+
+          # ------------------------------------------------------------
+          # fs/exec.c - execve
+          # ------------------------------------------------------------
+
+          patch(
+              "fs/exec.c",
+              """static int do_execveat_common(int fd, struct filename *filename,
+          \t\t\t      struct user_arg_ptr argv,
+          \t\t\t      struct user_arg_ptr envp,
+          \t\t\t      int flags)
+          {
+          \treturn __do_execve_file(fd, filename, argv, envp, flags, NULL);
+          }""",
+              """#ifdef CONFIG_KSU_MANUAL_HOOK
+          __attribute__((hot))
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+                          void *argv, void *envp, int *flags);
+          __attribute__((hot))
+          extern int ksu_handle_post_execveat(int *fd, struct filename **filename_ptr,
+                          void *argv, void *envp, int *flags, int *retval);
+          #endif
+
+          static int do_execveat_common(int fd, struct filename *filename,
+          \t\t\t      struct user_arg_ptr argv,
+          \t\t\t      struct user_arg_ptr envp,
+          \t\t\t      int flags)
+          {
+          #ifdef CONFIG_KSU_MANUAL_HOOK
+          \tint retval;
+
+          \tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+
+          \tretval = __do_execve_file(fd, filename, argv, envp, flags, NULL);
+
+          \tksu_handle_post_execveat(&fd, &filename, &argv, &envp, &flags, &retval);
+
+          \treturn retval;
+          #else
+          \treturn __do_execve_file(fd, filename, argv, envp, flags, NULL);
+          #endif
+          }"""
+          )
+
+          # ------------------------------------------------------------
+          # kernel/reboot.c - reboot
+          # ------------------------------------------------------------
+
+          patch(
+              "kernel/reboot.c",
+              """static DEFINE_MUTEX(reboot_mutex);""",
+              """static DEFINE_MUTEX(reboot_mutex);
+
+          #ifdef CONFIG_KSU_MANUAL_HOOK
+          extern int ksu_handle_sys_reboot(int magic1, int magic2,
+                          unsigned int cmd, void __user **arg);
+          #endif"""
+          )
+
+          patch(
+              "kernel/reboot.c",
+              """\tchar buffer[256];
+          \tint ret = 0;""",
+              """\tchar buffer[256];
+          \tint ret = 0;
+
+          #ifdef CONFIG_KSU_MANUAL_HOOK
+          \tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+          #endif"""
+          )
+
+          # ------------------------------------------------------------
+          # fs/read_write.c - read
+          # ------------------------------------------------------------
+
+          patch(
+              "fs/read_write.c",
+              """ssize_t ksys_read(unsigned int fd, char __user *buf, size_t count)
+          {
+          \tstruct fd f = fdget_pos(fd);""",
+              """ssize_t ksys_read(unsigned int fd, char __user *buf, size_t count)
+          {
+          \tstruct fd f = fdget_pos(fd);"""
+          )
+
+          patch(
+              "fs/read_write.c",
+              """SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+          {
+          \treturn ksys_read(fd, buf, count);
+          }""",
+              """#ifdef CONFIG_KSU_MANUAL_HOOK
+          extern bool ksu_init_rc_hook __read_mostly;
+          extern __attribute__((cold)) int ksu_handle_sys_read(
+                          unsigned int fd, char __user **buf_ptr,
+                          size_t *count_ptr);
+          #endif
+
+          SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+          {
+          #ifdef CONFIG_KSU_MANUAL_HOOK
+          \tif (unlikely(ksu_init_rc_hook))
+          \t\tksu_handle_sys_read(fd, &buf, &count);
+          #endif
+          \treturn ksys_read(fd, buf, count);
+          }"""
+          )
+
+          # ------------------------------------------------------------
+          # SELinux static exports are unnecessary with KALLSYMS_ALL.
+          # ------------------------------------------------------------
+
+          print("[OK] ReSukiSU 4.19 required hooks applied")
+
+          PY
+
+      - name: Verify ReSukiSU
+        run: |
+          echo "===== ReSukiSU CONFIG ====="
+          grep -E \
+            'CONFIG_KSU=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KALLSYMS_ALL=|CONFIG_KPROBES=' \
+            out/.config || true
+
+          echo "===== HOOK CHECK ====="
+          grep -n "ksu_handle_execveat" fs/exec.c
+          grep -n "ksu_handle_faccessat" fs/open.c
+          grep -n "ksu_handle_stat" fs/stat.c
+          grep -n "ksu_handle_sys_reboot" kernel/reboot.c
+          grep -n "ksu_handle_sys_read" fs/read_write.c
+
+      - name: Compile kernel
+        run: |
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+
+          make O=out \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            -j$(nproc)
+
+      - name: Upload kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: fajita-resukisu-kernel
+          path: |
+            out/arch/arm64/boot/Image
+            out/arch/arm64/boot/Image.gz
+            out/.config
