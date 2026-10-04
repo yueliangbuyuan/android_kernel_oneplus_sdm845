@@ -35,7 +35,7 @@ jobs:
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
 
-          make O=out ARCH=arm64 sdm845-perf_defconfig
+          make O=out ARCH=arm64 vendor/sdm845-perf_defconfig
 
           scripts/config --file out/.config --enable KSU
           scripts/config --file out/.config --enable KSU_MANUAL_HOOK
