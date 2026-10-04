@@ -8,296 +8,387 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout kernel
-        uses: actions/checkout@v4
 
-      - name: Install packages
-        run: |
-          sudo apt update
-          sudo apt install -y \
-            bc bison flex make gcc g++ \
-            libssl-dev libelf-dev \
-            python3 cpio rsync unzip wget
+    - name: Checkout kernel
+      uses: actions/checkout@v4
 
-      - name: Install Android Clang
-        run: |
-          git clone --depth=1 \
-            https://github.com/kdrag0n/proton-clang.git clang
-          chmod +x clang/bin/*
+    - name: Install packages
+      run: |
+        sudo apt update
+        sudo apt install -y \
+          bc bison flex make gcc g++ \
+          libssl-dev libelf-dev \
+          python3 cpio rsync unzip
 
-      - name: Integrate ReSukiSU
-        run: |
-          git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
-          chmod +x KernelSU/kernel/setup.sh
-          KernelSU/kernel/setup.sh
+    - name: Install Android Clang
+      run: |
+        git clone --depth=1 \
+          https://github.com/kdrag0n/proton-clang.git clang
+        chmod +x clang/bin/*
 
-      - name: Configure kernel
-        run: |
-          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+    - name: Clone ReSukiSU
+      run: |
+        git clone --depth=1 \
+          https://github.com/ReSukiSU/ReSukiSU.git KernelSU
 
-          make O=out ARCH=arm64 vendor/sdm845-perf_defconfig
+    - name: Add ReSukiSU
+      run: |
+        chmod +x KernelSU/kernel/setup.sh
+        KernelSU/kernel/setup.sh
 
-          scripts/config --file out/.config --enable KSU
-          scripts/config --file out/.config --enable KSU_MANUAL_HOOK
+    - name: Configure kernel
+      run: |
+        export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
 
-          scripts/config --file out/.config --enable KSU_MANUAL_HOOK_AUTO_SETUID_HOOK
-          scripts/config --file out/.config --enable KSU_MANUAL_HOOK_AUTO_INITRC_HOOK
-          scripts/config --file out/.config --enable KSU_MANUAL_HOOK_AUTO_INPUT_HOOK
+        make O=out ARCH=arm64 vendor/sdm845-perf_defconfig
 
-          scripts/config --file out/.config --enable KALLSYMS
-          scripts/config --file out/.config --enable KALLSYMS_ALL
-          scripts/config --file out/.config --disable KPROBES
-          scripts/config --file out/.config --enable OVERLAY_FS
+        ./scripts/config --file out/.config --enable KSU
+        ./scripts/config --file out/.config --enable KSU_MANUAL_HOOK
 
-          make O=out ARCH=arm64 olddefconfig
+        ./scripts/config --file out/.config --enable KALLSYMS
+        ./scripts/config --file out/.config --enable KALLSYMS_ALL
 
-      - name: Apply ReSukiSU 4.19 hooks
-        run: |
-          python3 <<'PY'
-          from pathlib import Path
+        ./scripts/config --file out/.config --disable KPROBES
 
-          def patch(path, old, new):
-              p = Path(path)
-              s = p.read_text()
+        ./scripts/config --file out/.config --enable OVERLAY_FS
 
-              if new in s:
-                  print("[OK] already patched:", path)
-                  return
+        ./scripts/config --file out/.config --enable KSU_MANUAL_HOOK_AUTO_ADD_TRY_UMOUNT
+        ./scripts/config --file out/.config --enable KSU_MANUAL_HOOK_AUTO_ADD_SUSFS
+        ./scripts/config --file out/.config --enable KSU_MANUAL_HOOK_AUTO_INITRC_HOOK
 
-              if old not in s:
-                  raise RuntimeError("Patch target not found: " + path)
+        make O=out ARCH=arm64 olddefconfig
 
-              p.write_text(s.replace(old, new, 1))
-              print("[OK] patched:", path)
+    - name: Apply ReSukiSU 4.19 hooks
+      run: |
+        python3 <<'PY'
+        from pathlib import Path
 
-          # ------------------------------------------------------------
-          # fs/stat.c
-          # ------------------------------------------------------------
+        def patch_once(path, old, new):
+            p = Path(path)
+            s = p.read_text()
 
-          patch(
-              "fs/stat.c",
-              """#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)""",
-              """#ifdef CONFIG_KSU_MANUAL_HOOK
-          __attribute__((hot))
-          extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
-                          int *flags);
-          extern void ksu_handle_newfstat_ret(unsigned int *fd,
-                          struct stat __user **statbuf_ptr);
-          #if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
-          extern void ksu_handle_fstat64_ret(unsigned long *fd,
-                          struct stat64 __user **statbuf_ptr);
-          #endif
-          #endif
+            if new in s:
+                print("[OK] already patched:", path)
+                return
 
-          #if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)"""
-          )
+            if old not in s:
+                raise RuntimeError("Patch target not found: " + path)
 
-          patch(
-              "fs/stat.c",
-              """{
-          \tstruct kstat stat;
-          \tint error;
+            p.write_text(s.replace(old, new, 1))
+            print("[OK] patched:", path)
 
-          \terror = vfs_fstatat(dfd, filename, &stat, flag);""",
-              """{
-          \tstruct kstat stat;
-          \tint error;
 
-          #ifdef CONFIG_KSU_MANUAL_HOOK
-          \tksu_handle_stat(&dfd, &filename, &flag);
-          #endif
+        # ============================================================
+        # fs/stat.c
+        # ============================================================
 
-          \terror = vfs_fstatat(dfd, filename, &stat, flag);"""
-          )
+        p = Path("fs/stat.c")
+        s = p.read_text()
 
-          patch(
-              "fs/stat.c",
-              """\tif (!error)
-          \t\terror = cp_new_stat(&stat, statbuf);
+        if "ksu_handle_stat" not in s:
 
-          \treturn error;
-          }
+            anchor = "SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,"
 
-          static int do_readlinkat""",
-              """\tif (!error)
-          \t\terror = cp_new_stat(&stat, statbuf);
+            decl = (
+                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                "__attribute__((hot))\n"
+                "extern int ksu_handle_stat(int *dfd, "
+                "const char __user **filename_user, int *flags);\n"
+                "extern void ksu_handle_newfstat_ret(unsigned int *fd, "
+                "struct stat __user **statbuf_ptr);\n"
+                "#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)\n"
+                "extern void ksu_handle_fstat64_ret(unsigned long *fd, "
+                "struct stat64 __user **statbuf_ptr);\n"
+                "#endif\n"
+                "#endif\n\n"
+            )
 
-          #ifdef CONFIG_KSU_MANUAL_HOOK
-          \tksu_handle_newfstat_ret(&fd, &statbuf);
-          #endif
+            if anchor not in s:
+                raise RuntimeError("stat.c newfstatat anchor not found")
 
-          \treturn error;
-          }
+            s = s.replace(anchor, decl + anchor, 1)
 
-          static int do_readlinkat"""
-          )
+            old = (
+                "\tstruct kstat stat;\n"
+                "\tint error;\n\n"
+                "\terror = vfs_fstatat(dfd, filename, &stat, flag);"
+            )
 
-          # ------------------------------------------------------------
-          # fs/open.c - faccessat
-          # ------------------------------------------------------------
+            new = (
+                "\tstruct kstat stat;\n"
+                "\tint error;\n\n"
+                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                "\tksu_handle_stat(&dfd, &filename, &flag);\n"
+                "#endif\n"
+                "\terror = vfs_fstatat(dfd, filename, &stat, flag);"
+            )
 
-          patch(
-              "fs/open.c",
-              """SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
-          {
-          \treturn do_faccessat(dfd, filename, mode);
-          }""",
-              """#ifdef CONFIG_KSU_MANUAL_HOOK
-          __attribute__((hot))
-          extern int ksu_handle_faccessat(int *dfd,
-                          const char __user **filename_user,
-                          int *mode, int *flags);
-          #endif
+            if old not in s:
+                raise RuntimeError("stat.c newfstatat body not found")
 
-          SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
-          {
-          #ifdef CONFIG_KSU_MANUAL_HOOK
-          \tksu_handle_faccessat(&dfd, &filename, &mode, NULL);
-          #endif
-          \treturn do_faccessat(dfd, filename, mode);
-          }"""
-          )
+            s = s.replace(old, new, 1)
 
-          # ------------------------------------------------------------
-          # fs/exec.c - execve
-          # ------------------------------------------------------------
+            old = (
+                "\tif (!error)\n"
+                "\t\terror = cp_new_stat(&stat, statbuf);\n\n"
+                "\treturn error;"
+            )
 
-          patch(
-              "fs/exec.c",
-              """static int do_execveat_common(int fd, struct filename *filename,
-          \t\t\t      struct user_arg_ptr argv,
-          \t\t\t      struct user_arg_ptr envp,
-          \t\t\t      int flags)
-          {
-          \treturn __do_execve_file(fd, filename, argv, envp, flags, NULL);
-          }""",
-              """#ifdef CONFIG_KSU_MANUAL_HOOK
-          __attribute__((hot))
-          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
-                          void *argv, void *envp, int *flags);
-          __attribute__((hot))
-          extern int ksu_handle_post_execveat(int *fd, struct filename **filename_ptr,
-                          void *argv, void *envp, int *flags, int *retval);
-          #endif
+            new = (
+                "\tif (!error)\n"
+                "\t\terror = cp_new_stat(&stat, statbuf);\n\n"
+                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                "\tksu_handle_newfstat_ret(&fd, &statbuf);\n"
+                "#endif\n"
+                "\treturn error;"
+            )
 
-          static int do_execveat_common(int fd, struct filename *filename,
-          \t\t\t      struct user_arg_ptr argv,
-          \t\t\t      struct user_arg_ptr envp,
-          \t\t\t      int flags)
-          {
-          #ifdef CONFIG_KSU_MANUAL_HOOK
-          \tint retval;
+            if old not in s:
+                raise RuntimeError("stat.c newfstat body not found")
 
-          \tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+            s = s.replace(old, new, 1)
 
-          \tretval = __do_execve_file(fd, filename, argv, envp, flags, NULL);
+            p.write_text(s)
+            print("[OK] patched: fs/stat.c")
 
-          \tksu_handle_post_execveat(&fd, &filename, &argv, &envp, &flags, &retval);
+        else:
+            print("[OK] already patched: fs/stat.c")
 
-          \treturn retval;
-          #else
-          \treturn __do_execve_file(fd, filename, argv, envp, flags, NULL);
-          #endif
-          }"""
-          )
 
-          # ------------------------------------------------------------
-          # kernel/reboot.c - reboot
-          # ------------------------------------------------------------
+        # ============================================================
+        # fs/open.c - faccessat
+        # ============================================================
 
-          patch(
-            "kernel/reboot.c",
-            """SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
-          \tvoid __user *, arg)
-          {""",
-            """#ifdef CONFIG_KSU_MANUAL_HOOK
-          extern int ksu_handle_sys_reboot(int magic1, int magic2,
-                        unsigned int cmd, void __user **arg);
-          #endif
+        p = Path("fs/open.c")
+        s = p.read_text()
 
-          SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
-          \tvoid __user *, arg)
-          {
-          #ifdef CONFIG_KSU_MANUAL_HOOK
-          \tif (system_state == SYSTEM_RUNNING)
-          \t\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
-          #endif"""
-          )
+        if "ksu_handle_faccessat" not in s:
 
-          # ------------------------------------------------------------
-          # fs/read_write.c - read
-          # ------------------------------------------------------------
+            anchor = (
+                "SYSCALL_DEFINE3(faccessat, int, dfd, "
+                "const char __user *, filename, int, mode)"
+            )
 
-          patch(
-              "fs/read_write.c",
-              """ssize_t ksys_read(unsigned int fd, char __user *buf, size_t count)
-          {
-          \tstruct fd f = fdget_pos(fd);""",
-              """ssize_t ksys_read(unsigned int fd, char __user *buf, size_t count)
-          {
-          \tstruct fd f = fdget_pos(fd);"""
-          )
+            decl = (
+                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                "__attribute__((hot))\n"
+                "extern int ksu_handle_faccessat(int *dfd, "
+                "const char __user **filename_user, int *mode, int *flags);\n"
+                "#endif\n\n"
+            )
 
-          patch(
-              "fs/read_write.c",
-              """SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
-          {
-          \treturn ksys_read(fd, buf, count);
-          }""",
-              """#ifdef CONFIG_KSU_MANUAL_HOOK
-          extern bool ksu_init_rc_hook __read_mostly;
-          extern __attribute__((cold)) int ksu_handle_sys_read(
-                          unsigned int fd, char __user **buf_ptr,
-                          size_t *count_ptr);
-          #endif
+            if anchor not in s:
+                raise RuntimeError("open.c faccessat anchor not found")
 
-          SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
-          {
-          #ifdef CONFIG_KSU_MANUAL_HOOK
-          \tif (unlikely(ksu_init_rc_hook))
-          \t\tksu_handle_sys_read(fd, &buf, &count);
-          #endif
-          \treturn ksys_read(fd, buf, count);
-          }"""
-          )
+            s = s.replace(anchor, decl + anchor, 1)
 
-          # ------------------------------------------------------------
-          # SELinux static exports are unnecessary with KALLSYMS_ALL.
-          # ------------------------------------------------------------
+            old = (
+                "{\n"
+                "\treturn do_faccessat(dfd, filename, mode);\n"
+                "}"
+            )
 
-          print("[OK] ReSukiSU 4.19 required hooks applied")
+            new = (
+                "{\n"
+                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
+                "#endif\n"
+                "\treturn do_faccessat(dfd, filename, mode);\n"
+                "}"
+            )
 
-          PY
+            if old not in s:
+                raise RuntimeError("open.c faccessat body not found")
 
-      - name: Verify ReSukiSU
-        run: |
-          echo "===== ReSukiSU CONFIG ====="
-          grep -E \
-            'CONFIG_KSU=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KALLSYMS_ALL=|CONFIG_KPROBES=' \
-            out/.config || true
+            s = s.replace(old, new, 1)
 
-          echo "===== HOOK CHECK ====="
-          grep -n "ksu_handle_execveat" fs/exec.c
-          grep -n "ksu_handle_faccessat" fs/open.c
-          grep -n "ksu_handle_stat" fs/stat.c
-          grep -n "ksu_handle_sys_reboot" kernel/reboot.c
-          grep -n "ksu_handle_sys_read" fs/read_write.c
+            p.write_text(s)
+            print("[OK] patched: fs/open.c")
 
-      - name: Compile kernel
-        run: |
-          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+        else:
+            print("[OK] already patched: fs/open.c")
 
-          make O=out \
-            ARCH=arm64 \
-            LLVM=1 \
-            LLVM_IAS=1 \
-            -j$(nproc)
 
-      - name: Upload kernel
-        uses: actions/upload-artifact@v4
-        with:
-          name: fajita-resukisu-kernel
-          path: |
-            out/arch/arm64/boot/Image
-            out/arch/arm64/boot/Image.gz
-            out/.config
+        # ============================================================
+        # fs/exec.c - execve
+        # ============================================================
+
+        p = Path("fs/exec.c")
+        s = p.read_text()
+
+        if "ksu_handle_execveat" not in s:
+
+            anchor = "static int do_execveat_common(int fd, struct filename *filename,"
+
+            decl = (
+                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                "__attribute__((hot))\n"
+                "extern int ksu_handle_execveat(int *fd, "
+                "struct filename **filename_ptr, void *argv, "
+                "void *envp, int *flags);\n"
+                "#endif\n\n"
+            )
+
+            if anchor not in s:
+                raise RuntimeError("exec.c do_execveat_common anchor not found")
+
+            s = s.replace(anchor, decl + anchor, 1)
+
+            old = (
+                "{\n"
+                "\treturn __do_execve_file(fd, filename, argv, envp, flags, NULL);\n"
+                "}"
+            )
+
+            new = (
+                "{\n"
+                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                "\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"
+                "#endif\n"
+                "\treturn __do_execve_file(fd, filename, argv, envp, flags, NULL);\n"
+                "}"
+            )
+
+            if old not in s:
+                raise RuntimeError("exec.c do_execveat_common body not found")
+
+            s = s.replace(old, new, 1)
+
+            p.write_text(s)
+            print("[OK] patched: fs/exec.c")
+
+        else:
+            print("[OK] already patched: fs/exec.c")
+
+
+        # ============================================================
+        # fs/read_write.c - read
+        # ============================================================
+
+        p = Path("fs/read_write.c")
+        s = p.read_text()
+
+        if "ksu_handle_sys_read" not in s:
+
+            anchor = (
+                "SYSCALL_DEFINE3(read, unsigned int, fd, "
+                "char __user *, buf, size_t, count)"
+            )
+
+            decl = (
+                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                "extern bool ksu_init_rc_hook __read_mostly;\n"
+                "extern __attribute__((cold)) int ksu_handle_sys_read(\n"
+                "\t\tunsigned int fd, char __user **buf_ptr, size_t *count_ptr);\n"
+                "#endif\n\n"
+            )
+
+            if anchor not in s:
+                raise RuntimeError("read_write.c read anchor not found")
+
+            s = s.replace(anchor, decl + anchor, 1)
+
+            old = (
+                "{\n"
+                "\treturn ksys_read(fd, buf, count);\n"
+                "}"
+            )
+
+            new = (
+                "{\n"
+                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                "\tif (unlikely(ksu_init_rc_hook))\n"
+                "\t\tksu_handle_sys_read(fd, &buf, &count);\n"
+                "#endif\n"
+                "\treturn ksys_read(fd, buf, count);\n"
+                "}"
+            )
+
+            if old not in s:
+                raise RuntimeError("read_write.c read body not found")
+
+            s = s.replace(old, new, 1)
+
+            p.write_text(s)
+            print("[OK] patched: fs/read_write.c")
+
+        else:
+            print("[OK] already patched: fs/read_write.c")
+
+
+        # ============================================================
+        # kernel/reboot.c - reboot
+        # ============================================================
+
+        p = Path("kernel/reboot.c")
+        s = p.read_text()
+
+        if "ksu_handle_sys_reboot" not in s:
+
+            anchor = (
+                "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, "
+                "unsigned int, cmd,"
+            )
+
+            decl = (
+                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                "extern int ksu_handle_sys_reboot(int magic1, int magic2, "
+                "unsigned int cmd, void __user **arg);\n"
+                "#endif\n\n"
+            )
+
+            if anchor not in s:
+                raise RuntimeError("reboot.c reboot anchor not found")
+
+            s = s.replace(anchor, decl + anchor, 1)
+
+            call_anchor = (
+                "\t/* We only trust the superuser with rebooting the system. */"
+            )
+
+            call = (
+                "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                "\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n"
+                "#endif\n"
+            )
+
+            if call_anchor not in s:
+                raise RuntimeError("reboot.c reboot body not found")
+
+            s = s.replace(call_anchor, call + call_anchor, 1)
+
+            p.write_text(s)
+            print("[OK] patched: kernel/reboot.c")
+
+        else:
+            print("[OK] already patched: kernel/reboot.c")
+
+
+        print("")
+        print("========================================")
+        print("ReSukiSU manual hooks completed")
+        print("========================================")
+        PY
+
+    - name: Verify configuration
+      run: |
+        grep -E '^CONFIG_KSU=|^CONFIG_KSU_MANUAL_HOOK=|^CONFIG_KALLSYMS=|^CONFIG_KALLSYMS_ALL=|^CONFIG_KPROBES=|^CONFIG_OVERLAY_FS=' out/.config
+
+    - name: Compile kernel
+      run: |
+        export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+
+        make O=out \
+          ARCH=arm64 \
+          LLVM=1 \
+          LLVM_IAS=1 \
+          -j$(nproc)
+
+    - name: Upload kernel
+      uses: actions/upload-artifact@v4
+      with:
+        name: fajita-resukisu-kernel
+        path: |
+          out/arch/arm64/boot/Image
+          out/arch/arm64/boot/Image.gz
+          out/arch/arm64/boot/Image.gz-dtb
