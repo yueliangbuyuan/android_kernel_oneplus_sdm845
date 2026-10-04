@@ -17,6 +17,7 @@ jobs:
       with:
         fetch-depth: 1
 
+
     # ============================================================
     # 2. Install build dependencies
     # ============================================================
@@ -37,6 +38,7 @@ jobs:
           rsync \
           unzip
 
+
     # ============================================================
     # 3. Android Clang
     # ============================================================
@@ -44,10 +46,12 @@ jobs:
       run: |
         git clone --depth=1 \
           https://github.com/kdrag0n/proton-clang.git clang
+
         chmod +x clang/bin/*
 
+
     # ============================================================
-    # 4. Restore kernel build cache
+    # 4. Restore build cache
     # ============================================================
     - name: Restore kernel build cache
       uses: actions/cache/restore@v4
@@ -57,6 +61,7 @@ jobs:
         restore-keys: |
           kernel-build-${{ runner.os }}-${{ github.ref_name }}-
 
+
     # ============================================================
     # 5. Clone ReSukiSU
     # ============================================================
@@ -65,13 +70,15 @@ jobs:
         git clone --depth=1 \
           https://github.com/ReSukiSU/ReSukiSU.git KernelSU
 
+
     # ============================================================
-    # 6. Integrate ReSukiSU
+    # 6. Add ReSukiSU to kernel
     # ============================================================
     - name: Add ReSukiSU
       run: |
         chmod +x KernelSU/kernel/setup.sh
         KernelSU/kernel/setup.sh
+
 
     # ============================================================
     # 7. Configure kernel
@@ -87,30 +94,19 @@ jobs:
         ./scripts/config --file out/.config --enable KSU_MANUAL_HOOK
 
         # --------------------------------------------------------
-        # Kernel symbols
+        # Required symbols
         # --------------------------------------------------------
         ./scripts/config --file out/.config --enable KALLSYMS
         ./scripts/config --file out/.config --enable KALLSYMS_ALL
 
         # --------------------------------------------------------
-        # ReSukiSU manual hook requirements
+        # Manual Hook
         # --------------------------------------------------------
         ./scripts/config --file out/.config --disable KPROBES
-        ./scripts/config --file out/.config --enable OVERLAY_FS
+        ./scripts/config --enable OVERLAY_FS
 
         # --------------------------------------------------------
-        # Legacy OnePlus battery drivers
-        #
-        # These drivers depend on missing private OnePlus/Oplus
-        # symbols in this kernel tree.
-        #
-        # Keep them disabled so they do not break the vmlinux link.
-        # --------------------------------------------------------
-        ./scripts/config --file out/.config --disable ONEPLUS_FASTCHG
-        ./scripts/config --file out/.config --disable FG_BQ27541
-
-        # --------------------------------------------------------
-        # ReSukiSU automatic hook options
+        # ReSukiSU optional automatic features
         # --------------------------------------------------------
         ./scripts/config --file out/.config \
           --enable KSU_MANUAL_HOOK_AUTO_ADD_TRY_UMOUNT
@@ -122,150 +118,574 @@ jobs:
           --enable KSU_MANUAL_HOOK_AUTO_INITRC_HOOK
 
         # --------------------------------------------------------
-        # Finalize configuration
+        # Disable old OnePlus private battery drivers.
+        #
+        # These drivers reference missing private OnePlus symbols:
+        # get_boot_mode
+        # usb_sw_gpio_set
+        # mcu_en_gpio_set
+        # notify_dash_unplug_register
+        # etc.
+        #
+        # Keeping them disabled avoids the previous vmlinux
+        # undefined-symbol failures.
+        # --------------------------------------------------------
+        ./scripts/config --file out/.config \
+          --disable ONEPLUS_FASTCHG
+
+        ./scripts/config --file out/.config \
+          --disable FG_BQ27541
+
+        # --------------------------------------------------------
+        # Normalize configuration
         # --------------------------------------------------------
         make O=out ARCH=arm64 olddefconfig
 
+
     # ============================================================
-    # 8. Apply ReSukiSU manual hooks
+    # 8. Apply ReSukiSU Manual Hooks
     # ============================================================
     - name: Apply ReSukiSU manual hooks
       run: |
         python3 <<'PY'
         from pathlib import Path
+        import re
+        import sys
 
-        def patch(path, old, new):
+        print("============================================================")
+        print(" ReSukiSU Manual Hook Patcher")
+        print("============================================================")
+
+        ROOT = Path(".")
+
+        def read(path):
+            return Path(path).read_text()
+
+        def write(path, text):
+            Path(path).write_text(text)
+
+        def require(path):
+            if not Path(path).exists():
+                raise RuntimeError(f"Missing source file: {path}")
+
+        def contains(path, text):
+            return text in read(path)
+
+        def add_before_once(path, marker, code, tag):
             p = Path(path)
             s = p.read_text()
 
-            if new in s:
-                print("[OK] already patched:", path)
+            if tag in s:
+                print(f"[OK] already patched: {path} -> {tag}")
                 return
 
-            if old not in s:
-                raise RuntimeError("Patch target not found: " + path)
+            pos = s.find(marker)
 
-            p.write_text(s.replace(old, new, 1))
-            print("[OK] patched:", path)
+            if pos < 0:
+                raise RuntimeError(
+                    f"Patch target not found in {path}: {marker}"
+                )
 
-        # --------------------------------------------------------
+            s = s[:pos] + code + s[pos:]
+            p.write_text(s)
+
+            print(f"[OK] patched: {path} -> {tag}")
+
+        def add_after_once(path, marker, code, tag):
+            p = Path(path)
+            s = p.read_text()
+
+            if tag in s:
+                print(f"[OK] already patched: {path} -> {tag}")
+                return
+
+            pos = s.find(marker)
+
+            if pos < 0:
+                raise RuntimeError(
+                    f"Patch target not found in {path}: {marker}"
+                )
+
+            end = pos + len(marker)
+
+            s = s[:end] + code + s[end:]
+            p.write_text(s)
+
+            print(f"[OK] patched: {path} -> {tag}")
+
+
+        # ========================================================
+        # Verify ReSukiSU was added
+        # ========================================================
+        if not Path("drivers/kernelsu").exists():
+            raise RuntimeError(
+                "drivers/kernelsu does not exist. ReSukiSU setup failed."
+            )
+
+        print("[OK] drivers/kernelsu exists")
+
+
+        # ========================================================
+        # Detect available ReSukiSU handlers
+        # ========================================================
+        ksu_files = []
+
+        for p in Path("drivers/kernelsu").rglob("*"):
+            if p.is_file() and p.suffix in (".c", ".h"):
+                try:
+                    ksu_files.append(p.read_text())
+                except Exception:
+                    pass
+
+        ksu_text = "\n".join(ksu_files)
+
+        def ksu_has(symbol):
+            return re.search(
+                r"\b" + re.escape(symbol) + r"\b",
+                ksu_text
+            ) is not None
+
+        required_handlers = [
+            "ksu_handle_execveat",
+            "ksu_handle_faccessat",
+            "ksu_handle_stat",
+            "ksu_handle_sys_reboot",
+        ]
+
+        for symbol in required_handlers:
+            if not ksu_has(symbol):
+                raise RuntimeError(
+                    f"ReSukiSU handler not found: {symbol}"
+                )
+            print(f"[OK] found handler: {symbol}")
+
+        if not ksu_has("ksu_handle_sys_read"):
+            print("[WARN] ksu_handle_sys_read not found")
+            print("[WARN] read hook will be skipped")
+        else:
+            print("[OK] found handler: ksu_handle_sys_read")
+
+
+        # ========================================================
         # fs/stat.c
-        # --------------------------------------------------------
-        patch(
+        #
+        # Linux 4.19 uses:
+        #
+        # error = vfs_fstatat(dfd, filename, &stat, flag);
+        #
+        # ReSukiSU expects:
+        #
+        # ksu_handle_stat(&dfd, &filename, &flag);
+        # ========================================================
+        require("fs/stat.c")
+
+        stat_decl = r'''
+        #ifdef CONFIG_KSU
+        extern int ksu_handle_stat(
+            int *dfd,
+            const char __user **filename_user,
+            int *flags
+        );
+        #endif
+
+        '''
+
+        stat_marker = "extern int ksu_handle_stat"
+
+        if not contains("fs/stat.c", stat_marker):
+            text = read("fs/stat.c")
+
+            # Put declaration before first function body.
+            m = re.search(
+                r"\nstatic\s+int\s+.*?\n\{",
+                text
+            )
+
+            if m:
+                text = text[:m.start()] + "\n" + stat_decl + text[m.start():]
+            else:
+                text = stat_decl + text
+
+            write("fs/stat.c", text)
+            print("[OK] added stat declaration")
+        else:
+            print("[OK] stat declaration already exists")
+
+
+        stat_call = r'''
+        #ifdef CONFIG_KSU
+            ksu_handle_stat(&dfd, &filename, &flag);
+        #endif
+
+        '''
+
+        add_before_once(
             "fs/stat.c",
-            """SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
-                struct stat __user *, statbuf, int, flag)
-        {""",
-            """SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
-                struct stat __user *, statbuf, int, flag)
-        {
-            ksu_handle_stat((unsigned int)dfd, filename, statbuf);
-        """
+            "error = vfs_fstatat(dfd, filename, &stat, flag);",
+            stat_call,
+            "ksu_handle_stat(&dfd, &filename, &flag)"
         )
 
-        patch(
-            "fs/stat.c",
-            """SYSCALL_DEFINE2(stat, const char __user *, filename,
-                struct stat __user *, statbuf)
-        {""",
-            """SYSCALL_DEFINE2(stat, const char __user *, filename,
-                struct stat __user *, statbuf)
-        {
-            ksu_handle_stat(AT_FDCWD, filename, statbuf);
-        """
-        )
 
-        # --------------------------------------------------------
+        # ========================================================
         # fs/open.c
-        # --------------------------------------------------------
-        patch(
+        #
+        # Linux 4.19:
+        #
+        # return do_faccessat(dfd, filename, mode);
+        #
+        # ReSukiSU:
+        #
+        # ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+        # ========================================================
+        require("fs/open.c")
+
+        open_decl = r'''
+        #ifdef CONFIG_KSU
+        extern int ksu_handle_faccessat(
+            int *dfd,
+            const char __user **filename_user,
+            int *mode,
+            int *flags
+        );
+        #endif
+
+        '''
+
+        if not contains("fs/open.c", "extern int ksu_handle_faccessat"):
+            text = read("fs/open.c")
+
+            marker = "SYSCALL_DEFINE3(faccessat"
+
+            pos = text.find(marker)
+
+            if pos < 0:
+                raise RuntimeError(
+                    "Cannot find SYSCALL_DEFINE3(faccessat) in fs/open.c"
+                )
+
+            text = text[:pos] + open_decl + text[pos:]
+            write("fs/open.c", text)
+
+            print("[OK] added faccessat declaration")
+        else:
+            print("[OK] faccessat declaration already exists")
+
+
+        open_call = r'''
+        #ifdef CONFIG_KSU
+            ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+        #endif
+
+        '''
+
+        add_before_once(
             "fs/open.c",
-            """SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename,
-                int, mode)
-        {""",
-            """SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename,
-                int, mode)
-        {
-            ksu_handle_faccessat(dfd, filename, mode);
-        """
+            "return do_faccessat(dfd, filename, mode);",
+            open_call,
+            "ksu_handle_faccessat(&dfd, &filename, &mode, NULL)"
         )
 
-        # --------------------------------------------------------
+
+        # ========================================================
         # fs/exec.c
-        # --------------------------------------------------------
-        patch(
-            "fs/exec.c",
-            """SYSCALL_DEFINE3(execve,
-                const char __user *, filename,
-                const char __user *const __user *, argv,
-                const char __user *const __user *, envp)
-        {""",
-            """SYSCALL_DEFINE3(execve,
-                const char __user *, filename,
-                const char __user *const __user *, argv,
-                const char __user *const __user *, envp)
-        {
-            ksu_handle_execveat(AT_FDCWD, filename, argv, envp, 0);
-        """
-        )
+        # ========================================================
+        require("fs/exec.c")
 
-        # --------------------------------------------------------
+        exec_decl = r'''
+        #ifdef CONFIG_KSU
+        extern int ksu_handle_execveat(
+            int *fd,
+            struct filename **filename_ptr,
+            void *argv,
+            void *envp,
+            int *flags
+        );
+        #endif
+
+        '''
+
+        if not contains("fs/exec.c", "extern int ksu_handle_execveat"):
+            text = read("fs/exec.c")
+
+            marker = "int do_execve(struct filename *filename,"
+
+            pos = text.find(marker)
+
+            if pos < 0:
+                raise RuntimeError(
+                    "Cannot find do_execve() in fs/exec.c"
+                )
+
+            text = text[:pos] + exec_decl + text[pos:]
+            write("fs/exec.c", text)
+
+            print("[OK] added execveat declaration")
+        else:
+            print("[OK] execveat declaration already exists")
+
+
+        exec_marker = "return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"
+
+        exec_call = r'''
+        #ifdef CONFIG_KSU
+            ksu_handle_execveat(
+                (int *)AT_FDCWD,
+                &filename,
+                &argv,
+                &envp,
+                0
+            );
+        #endif
+
+        '''
+
+        if exec_marker in read("fs/exec.c"):
+            add_before_once(
+                "fs/exec.c",
+                exec_marker,
+                exec_call,
+                "ksu_handle_execveat"
+            )
+        else:
+            raise RuntimeError(
+                "Cannot find do_execveat_common() call in fs/exec.c"
+            )
+
+
+        # ========================================================
         # fs/read_write.c
-        # --------------------------------------------------------
-        patch(
-            "fs/read_write.c",
-            """SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf,
-                size_t, count)
-        {""",
-            """SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf,
-                size_t, count)
-        {
-            ksu_handle_sys_read(fd, buf, count);
-        """
-        )
+        # ========================================================
+        require("fs/read_write.c")
 
-        # --------------------------------------------------------
+        if ksu_has("ksu_handle_sys_read"):
+
+            read_decl = r'''
+            #ifdef CONFIG_KSU
+            extern bool ksu_vfs_read_hook __read_mostly;
+            extern int ksu_handle_sys_read(
+                unsigned int fd,
+                char __user **buf_ptr,
+                size_t *count_ptr
+            );
+            #endif
+
+            '''
+
+            if not contains(
+                "fs/read_write.c",
+                "extern int ksu_handle_sys_read"
+            ):
+                text = read("fs/read_write.c")
+
+                marker = "SYSCALL_DEFINE3(read,"
+
+                pos = text.find(marker)
+
+                if pos < 0:
+                    raise RuntimeError(
+                        "Cannot find SYSCALL_DEFINE3(read) in fs/read_write.c"
+                    )
+
+                text = text[:pos] + read_decl + text[pos:]
+                write("fs/read_write.c", text)
+
+                print("[OK] added read declaration")
+            else:
+                print("[OK] read declaration already exists")
+
+
+            read_call = r'''
+            #ifdef CONFIG_KSU
+                if (unlikely(ksu_vfs_read_hook))
+                    ksu_handle_sys_read(fd, &buf, &count);
+            #endif
+
+            '''
+
+            if "return ksys_read(fd, buf, count);" in read("fs/read_write.c"):
+
+                add_before_once(
+                    "fs/read_write.c",
+                    "return ksys_read(fd, buf, count);",
+                    read_call,
+                    "ksu_handle_sys_read(fd, &buf, &count)"
+                )
+
+            elif "if (f.file) {" in read("fs/read_write.c"):
+
+                add_before_once(
+                    "fs/read_write.c",
+                    "if (f.file) {",
+                    read_call,
+                    "ksu_handle_sys_read(fd, &buf, &count)"
+                )
+
+            else:
+                raise RuntimeError(
+                    "Cannot find suitable read() hook point"
+                )
+
+        else:
+            print("[SKIP] read hook not available in this ReSukiSU tree")
+
+
+        # ========================================================
         # kernel/reboot.c
-        # --------------------------------------------------------
-        patch(
+        #
+        # Correct ReSukiSU signature:
+        #
+        # ksu_handle_sys_reboot(
+        #     magic1,
+        #     magic2,
+        #     cmd,
+        #     &arg
+        # );
+        # ========================================================
+        require("kernel/reboot.c")
+
+        reboot_decl = r'''
+        #ifdef CONFIG_KSU
+        extern int ksu_handle_sys_reboot(
+            int magic1,
+            int magic2,
+            unsigned int cmd,
+            void __user **arg
+        );
+        #endif
+
+        '''
+
+        if not contains(
             "kernel/reboot.c",
-            """SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
-                void __user *, arg)
-        {""",
-            """SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
-                void __user *, arg)
-        {
-            ksu_handle_sys_reboot(cmd);
-        """
+            "extern int ksu_handle_sys_reboot"
+        ):
+            text = read("kernel/reboot.c")
+
+            marker = "SYSCALL_DEFINE4(reboot"
+
+            pos = text.find(marker)
+
+            if pos < 0:
+                raise RuntimeError(
+                    "Cannot find SYSCALL_DEFINE4(reboot) in kernel/reboot.c"
+                )
+
+            text = text[:pos] + reboot_decl + text[pos:]
+            write("kernel/reboot.c", text)
+
+            print("[OK] added reboot declaration")
+        else:
+            print("[OK] reboot declaration already exists")
+
+
+        reboot_call = r'''
+        #ifdef CONFIG_KSU
+            if (system_state == SYSTEM_RUNNING) {
+                ksu_handle_sys_reboot(
+                    magic1,
+                    magic2,
+                    cmd,
+                    &arg
+                );
+            }
+        #endif
+
+        '''
+
+        reboot_marker = "if (!ns_capable(pid_ns->user_ns, CAP_SYS_BOOT))"
+
+        add_before_once(
+            "kernel/reboot.c",
+            reboot_marker,
+            reboot_call,
+            "ksu_handle_sys_reboot"
         )
 
-        print("===== ReSukiSU hooks finished =====")
+
+        # ========================================================
+        # Final verification
+        # ========================================================
+        print("")
+        print("============================================================")
+        print(" Final hook verification")
+        print("============================================================")
+
+        checks = {
+            "fs/stat.c": [
+                "ksu_handle_stat"
+            ],
+            "fs/open.c": [
+                "ksu_handle_faccessat"
+            ],
+            "fs/exec.c": [
+                "ksu_handle_execveat"
+            ],
+            "kernel/reboot.c": [
+                "ksu_handle_sys_reboot"
+            ],
+        }
+
+        for path, symbols in checks.items():
+            text = read(path)
+
+            for symbol in symbols:
+                if symbol not in text:
+                    raise RuntimeError(
+                        f"Verification failed: {symbol} missing from {path}"
+                    )
+
+                print(f"[OK] {path}: {symbol}")
+
+        if ksu_has("ksu_handle_sys_read"):
+            if "ksu_handle_sys_read" not in read("fs/read_write.c"):
+                raise RuntimeError(
+                    "ksu_handle_sys_read exists in ReSukiSU but "
+                    "was not inserted into fs/read_write.c"
+                )
+
+            print(
+                "[OK] fs/read_write.c: ksu_handle_sys_read"
+            )
+
+        print("")
+        print("============================================================")
+        print(" ReSukiSU Manual Hooks finished successfully")
+        print("============================================================")
         PY
 
+
     # ============================================================
-    # 9. Verify kernel configuration
+    # 9. Verify configuration
     # ============================================================
     - name: Verify kernel configuration
       run: |
-        echo "===== ReSukiSU CONFIG ====="
+        echo "============================================================"
+        echo " ReSukiSU CONFIG"
+        echo "============================================================"
 
         grep -E \
           'CONFIG_KSU=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KALLSYMS=|CONFIG_KALLSYMS_ALL=' \
           out/.config || true
 
         echo
-        echo "===== Legacy OnePlus battery CONFIG ====="
+        echo "============================================================"
+        echo " Legacy OnePlus battery CONFIG"
+        echo "============================================================"
 
         grep -E \
           'CONFIG_ONEPLUS_FASTCHG=|CONFIG_FG_BQ27541=' \
           out/.config || true
 
         echo
-        echo "===== ReSukiSU related CONFIG ====="
+        echo "============================================================"
+        echo " Hook-related CONFIG"
+        echo "============================================================"
 
         grep -E \
           'CONFIG_KPROBES=|CONFIG_OVERLAY_FS=' \
           out/.config || true
+
 
     # ============================================================
     # 10. Build kernel
@@ -281,8 +701,9 @@ jobs:
           KCFLAGS="-Wno-unused-variable" \
           -j$(nproc)
 
+
     # ============================================================
-    # 11. Save kernel build cache
+    # 11. Save build cache
     # ============================================================
     - name: Save kernel build cache
       if: always()
@@ -290,6 +711,7 @@ jobs:
       with:
         path: out
         key: kernel-build-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+
 
     # ============================================================
     # 12. Upload kernel
