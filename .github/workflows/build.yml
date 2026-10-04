@@ -1,4 +1,3 @@
-```yaml
 name: Build ReSukiSU fajita Kernel
 
 on:
@@ -48,7 +47,7 @@ jobs:
         chmod +x clang/bin/*
 
     # ============================================================
-    # 4. Restore build cache
+    # 4. Restore kernel build cache
     # ============================================================
     - name: Restore kernel build cache
       uses: actions/cache/restore@v4
@@ -81,23 +80,38 @@ jobs:
       run: |
         make O=out ARCH=arm64 vendor/sdm845-perf_defconfig
 
+        # --------------------------------------------------------
         # ReSukiSU
+        # --------------------------------------------------------
         ./scripts/config --file out/.config --enable KSU
         ./scripts/config --file out/.config --enable KSU_MANUAL_HOOK
 
+        # --------------------------------------------------------
         # Kernel symbols
+        # --------------------------------------------------------
         ./scripts/config --file out/.config --enable KALLSYMS
         ./scripts/config --file out/.config --enable KALLSYMS_ALL
 
+        # --------------------------------------------------------
         # ReSukiSU manual hook requirements
+        # --------------------------------------------------------
         ./scripts/config --file out/.config --disable KPROBES
         ./scripts/config --file out/.config --enable OVERLAY_FS
 
-        # OnePlus battery drivers
-        ./scripts/config --file out/.config --enable ONEPLUS_FASTCHG
-        ./scripts/config --file out/.config --enable FG_BQ27541
+        # --------------------------------------------------------
+        # Legacy OnePlus battery drivers
+        #
+        # These drivers depend on missing private OnePlus/Oplus
+        # symbols in this kernel tree.
+        #
+        # Keep them disabled so they do not break the vmlinux link.
+        # --------------------------------------------------------
+        ./scripts/config --file out/.config --disable ONEPLUS_FASTCHG
+        ./scripts/config --file out/.config --disable FG_BQ27541
 
+        # --------------------------------------------------------
         # ReSukiSU automatic hook options
+        # --------------------------------------------------------
         ./scripts/config --file out/.config \
           --enable KSU_MANUAL_HOOK_AUTO_ADD_TRY_UMOUNT
 
@@ -107,57 +121,13 @@ jobs:
         ./scripts/config --file out/.config \
           --enable KSU_MANUAL_HOOK_AUTO_INITRC_HOOK
 
+        # --------------------------------------------------------
+        # Finalize configuration
+        # --------------------------------------------------------
         make O=out ARCH=arm64 olddefconfig
 
     # ============================================================
-    # 8. Fix missing OnePlus get_boot_mode()
-    #
-    # The original bq27541 driver includes:
-    #
-    #   <linux/oneplus/boot_mode.h>
-    #
-    # and calls:
-    #
-    #   get_boot_mode()
-    #
-    # The current tree contains the declaration but no implementation.
-    #
-    # We provide a conservative compatibility implementation which
-    # always reports NORMAL boot.
-    #
-    # This preserves normal Android boot behaviour and avoids
-    # incorrectly identifying normal boot as Recovery/Charge.
-    # ============================================================
-    - name: Fix OnePlus get_boot_mode
-      run: |
-        mkdir -p drivers/power/oneplus
-
-        cat > drivers/power/oneplus/boot_mode_compat.c <<'EOF'
-        #include <linux/init.h>
-        #include <linux/oneplus/boot_mode.h>
-        #include <linux/export.h>
-
-        enum oem_boot_mode get_boot_mode(void)
-        {
-            return MSM_BOOT_MODE__NORMAL;
-        }
-
-        EXPORT_SYMBOL_GPL(get_boot_mode);
-        EOF
-
-        if ! grep -q "boot_mode_compat.o" drivers/power/oneplus/Makefile 2>/dev/null; then
-          echo "obj-y += boot_mode_compat.o" >> drivers/power/oneplus/Makefile
-        fi
-
-        if ! grep -q "oneplus/" drivers/power/Makefile 2>/dev/null; then
-          echo "obj-y += oneplus/" >> drivers/power/Makefile
-        fi
-
-        echo "===== get_boot_mode compatibility source ====="
-        cat drivers/power/oneplus/boot_mode_compat.c
-
-    # ============================================================
-    # 9. ReSukiSU manual hooks
+    # 8. Apply ReSukiSU manual hooks
     # ============================================================
     - name: Apply ReSukiSU manual hooks
       run: |
@@ -273,95 +243,32 @@ jobs:
         PY
 
     # ============================================================
-    # 10. Verify configuration
+    # 9. Verify kernel configuration
     # ============================================================
     - name: Verify kernel configuration
       run: |
-        echo "===== KSU CONFIG ====="
+        echo "===== ReSukiSU CONFIG ====="
+
         grep -E \
           'CONFIG_KSU=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KALLSYMS=|CONFIG_KALLSYMS_ALL=' \
           out/.config || true
 
-        echo "===== BATTERY CONFIG ====="
+        echo
+        echo "===== Legacy OnePlus battery CONFIG ====="
+
         grep -E \
           'CONFIG_ONEPLUS_FASTCHG=|CONFIG_FG_BQ27541=' \
           out/.config || true
 
-        echo "===== RELEVANT CONFIG ====="
+        echo
+        echo "===== ReSukiSU related CONFIG ====="
+
         grep -E \
           'CONFIG_KPROBES=|CONFIG_OVERLAY_FS=' \
           out/.config || true
 
     # ============================================================
-    # 11. Verify get_boot_mode
-    # ============================================================
-    - name: Verify get_boot_mode
-      run: |
-        echo "===== get_boot_mode definitions ====="
-
-        grep -Rnw \
-          --exclude-dir=.git \
-          --exclude-dir=out \
-          --include='*.c' \
-          --include='*.h' \
-          . -e 'get_boot_mode' || true
-
-        echo
-        echo "===== compatibility file ====="
-        cat drivers/power/oneplus/boot_mode_compat.c
-
-        echo
-        echo "===== boot_mode.h ====="
-        cat include/linux/oneplus/boot_mode.h
-
-    # ============================================================
-    # 12. Check known missing symbols
-    # ============================================================
-    - name: Check missing symbols
-      run: |
-        echo "===== OnePlus fast charging symbols ====="
-
-        grep -Rnw \
-          --exclude-dir=.git \
-          --exclude-dir=out \
-          --include='*.c' \
-          --include='*.h' \
-          drivers/power/supply/qcom \
-          -e 'switch_mode_to_normal' \
-          -e 'usb_sw_gpio_set' \
-          -e 'mcu_en_gpio_set' \
-          -e 'notify_dash_unplug_register' \
-          -e 'notify_dash_unplug_unregister' \
-          -e 'set_mcu_en_gpio_value' \
-          || true
-
-        echo
-        echo "===== BQ fuel gauge symbols ====="
-
-        grep -Rnw \
-          --exclude-dir=.git \
-          --exclude-dir=out \
-          --include='*.c' \
-          --include='*.h' \
-          drivers/power/supply/qcom \
-          -e 'get_extern_fg_regist_done' \
-          -e 'get_extern_bq_present' \
-          -e 'get_prop_pre_shutdown_soc' \
-          || true
-
-        echo
-        echo "===== get_boot_mode ====="
-
-        grep -Rnw \
-          --exclude-dir=.git \
-          --exclude-dir=out \
-          --include='*.c' \
-          --include='*.h' \
-          . -e 'get_boot_mode' \
-          || true
-
-    # ============================================================
-    # 13. Compile kernel
+    # 10. Build kernel
     # ============================================================
     - name: Build kernel
       run: |
@@ -375,7 +282,7 @@ jobs:
           -j$(nproc)
 
     # ============================================================
-    # 14. Save build cache
+    # 11. Save kernel build cache
     # ============================================================
     - name: Save kernel build cache
       if: always()
@@ -385,7 +292,7 @@ jobs:
         key: kernel-build-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
 
     # ============================================================
-    # 15. Upload kernel
+    # 12. Upload kernel
     # ============================================================
     - name: Upload kernel
       if: success()
