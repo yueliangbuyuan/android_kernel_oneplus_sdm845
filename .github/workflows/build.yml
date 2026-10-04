@@ -133,29 +133,6 @@ jobs:
           )
 
           # ------------------------------------------------------------
-          # fs/stat.c - fstat64 / fstatat64
-          # ------------------------------------------------------------
-
-          patch(
-              "fs/stat.c",
-              """SYSCALL_DEFINE4(fstatat64, int, dfd, const char __user *, filename,
-          \t\tstruct stat64 __user *, statbuf, int, flag)
-          {
-          \tstruct kstat stat;
-          \tint error;
-          \terror = vfs_fstatat(dfd, filename, &stat, flag);""",
-              """SYSCALL_DEFINE4(fstatat64, int, dfd, const char __user *, filename,
-          \t\tstruct stat64 __user *, statbuf, int, flag)
-          {
-          \tstruct kstat stat;
-          \tint error;
-          #ifdef CONFIG_KSU_MANUAL_HOOK
-          \tksu_handle_stat(&dfd, &filename, &flag);
-          #endif
-          \terror = vfs_fstatat(dfd, filename, &stat, flag);"""
-          )
-
-          # ------------------------------------------------------------
           # fs/open.c - faccessat
           # ------------------------------------------------------------
 
