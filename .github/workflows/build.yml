@@ -1,4 +1,3 @@
-```yaml
 name: Build ReSukiSU fajita Kernel
 
 on:
@@ -304,4 +303,3 @@ jobs:
           out/arch/arm64/boot/Image
           out/arch/arm64/boot/Image.gz
           out/arch/arm64/boot/Image.gz-dtb
-```
