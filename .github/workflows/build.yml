@@ -382,6 +382,7 @@ jobs:
           ARCH=arm64 \
           LLVM=1 \
           LLVM_IAS=1 \
+          KCFLAGS="-Wno-unused-variable" \
           -j$(nproc)
 
     - name: Upload kernel
