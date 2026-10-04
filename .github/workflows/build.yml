@@ -138,34 +138,6 @@ jobs:
 
           patch(
               "fs/stat.c",
-              """SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)
-          {
-          \tstruct kstat stat;
-          \tint error = vfs_fstat(fd, &stat);
-
-          \tif (!error)
-          \t\terror = cp_new_stat64(&stat, statbuf);
-
-          \treturn error;
-          }""",
-              """SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)
-          {
-          \tstruct kstat stat;
-          \tint error = vfs_fstat(fd, &stat);
-
-          \tif (!error)
-          \t\terror = cp_new_stat64(&stat, statbuf);
-
-          #ifdef CONFIG_KSU_MANUAL_HOOK
-          \tksu_handle_fstat64_ret(&fd, &statbuf);
-          #endif
-
-          \treturn error;
-          }"""
-          )
-
-          patch(
-              "fs/stat.c",
               """SYSCALL_DEFINE4(fstatat64, int, dfd, const char __user *, filename,
           \t\tstruct stat64 __user *, statbuf, int, flag)
           {
