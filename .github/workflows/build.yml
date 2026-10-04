@@ -21,9 +21,9 @@ jobs:
 
       - name: Install Android Clang
         run: |
-          wget -q https://github.com/kdrag0n/proton-clang/releases/download/2022-05-17/proton-clang.tar.gz
-          mkdir -p clang
-          tar -xf proton-clang.tar.gz -C clang
+          git clone --depth=1 \
+            https://github.com/kdrag0n/proton-clang.git clang
+          chmod +x clang/bin/*
 
       - name: Integrate ReSukiSU
         run: |
